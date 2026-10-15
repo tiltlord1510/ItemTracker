@@ -30,6 +30,7 @@ ItemTracker allows you to track player gold as well as any game currency using a
 ### Recommended Companion AddOn: `idTip`
 Because World of Warcraft uses numeric IDs for currencies, we recommend installing the **idTip** AddOn alongside **ItemTracker**. **idTip** adds internal **Currency IDs** (as well as Item IDs and Spell IDs) directly to your in-game tooltips when hovering over currencies in your Character Sheet (`C` -> Currency tab), making it effortless to look up any Currency ID.
 
+https://www.curseforge.com/wow/addons/idtip/download/3454226
 ---
 
 ## Slash Commands
