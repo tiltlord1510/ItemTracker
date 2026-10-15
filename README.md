@@ -1,4 +1,4 @@
-# ItemTracker (WoW Patch 9.2.7)
+# 🔍 ItemTracker (WoW Patch 9.2.7)
 
 **ItemTracker** is a flexible inventory and currency monitoring AddOn designed for **World of Warcraft Patch 9.2.7 (Shadowlands)**. It provides real-time tracking, net session gains, and hourly rate calculations (`items/hr` or `gold/hr`) across customizable, independent frames—making it an ideal companion for gold farming, material collection, or tracking PvP currencies.
 
