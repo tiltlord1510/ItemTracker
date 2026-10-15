@@ -17,6 +17,10 @@
 - **Flexible Input Methods:** Enter numeric IDs, paste item/currency links, or **drag and drop** items directly into the input field.
 - **Interactive Minimap Icon:** Easily open the Options menu or drag the button around the minimap border.
 
+## 🖼️ Preview
+
+<img width="502" height="593" alt="image" src="https://github.com/user-attachments/assets/c12361f8-f43f-482b-b5d3-5c73e00cde5e" />
+
 ---
 
 ## Currency Tracking & `idTip`
