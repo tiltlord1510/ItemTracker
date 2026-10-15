@@ -1,0 +1,8 @@
+## Interface: 90207
+## Title: Item Tracker (9.2.7)
+## Notes: Tracks item count, session gains, and items gained per hour.
+## Author: Custom
+## Version: 1.0
+## SavedVariables: ItemTrackerDB
+
+ItemTracker.lua
