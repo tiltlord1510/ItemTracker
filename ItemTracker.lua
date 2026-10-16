@@ -1,76 +1,61 @@
 local addonName, ns = ...
 
--- Helper function to safely trim strings in standard Lua
 local function trim(s)
     return (s:gsub("^%s*(.-)%s*$", "%1"))
 end
 
--- Helper function to extract Item/Currency ID or Link
--- Returns: id (number or string "cID"), isCurrency (boolean)
 local function GetTargetFromInput(text)
     if not text or text == "" then return nil, false end
     
-    -- Check for explicit currency prefix "c" (e.g., "c1792" or "c0" for gold)
     local currID = string.match(text, "^c(%d+)$")
-    if currID then
-        return "c" .. currID, true
-    end
+    if currID then return "c" .. currID, true end
 
-    -- Check for gold keyword
-    if text == "gold" or text == "money" then
-        return "c0", true
-    end
+    if text == "gold" or text == "money" then return "c0", true end
 
-    -- Check if input is a raw item ID number
     local id = tonumber(text)
     if id then return id, false end
 
-    -- Parse standard WoW Item Link pattern (|Hitem:172040:...)
     id = string.match(text, "item:(%d+)")
     if id then return tonumber(id), false end
 
-    -- Parse WoW Currency Link pattern (|Hcurrency:1792:...)
     id = string.match(text, "currency:(%d+)")
     if id then return "c" .. id, true end
 
     return nil, false
 end
 
--- Default SavedVariables (Character Specific)
+-- Default SavedVariables (Includes Migration Logic for Old DB Format)
 local function InitDB()
     ItemTrackerDB = ItemTrackerDB or {}
-    ItemTrackerDB.targetID = ItemTrackerDB.targetID or ItemTrackerDB.targetItemID or 172040 -- Default: Protoplasmic Core
-    ItemTrackerDB.shown = (ItemTrackerDB.shown == nil) and true or ItemTrackerDB.shown
     ItemTrackerDB.savedItems = ItemTrackerDB.savedItems or {
-        172040,   -- Protoplasmic Core (Item)
-        178786,   -- Heavy Callous Hide (Item)
-        "c0",     -- Gold (Currency)
-        "c1792",  -- Honor (Currency)
+        { id = 172040, tracking = true },  -- Protoplasmic Core
+        { id = 178786, tracking = false }, -- Heavy Callous Hide
+        { id = "c0",   tracking = false }, -- Gold
+        { id = "c1792", tracking = false },-- Honor
     }
+    
+    -- Automatic Data Migration: Converts raw number IDs into table entries
+    for idx, item in ipairs(ItemTrackerDB.savedItems) do
+        if type(item) == "number" or type(item) == "string" then
+            ItemTrackerDB.savedItems[idx] = { id = item, tracking = false }
+        end
+    end
+
     ItemTrackerDB.minimapPos = ItemTrackerDB.minimapPos or 45
 end
 
-local trackingTargetID = nil
-local isTrackingCurrency = false
-local initialCount = nil
-local startTime = nil
-
-----------------------------------------------------
--- SESSION RESET LOGIC
-----------------------------------------------------
-local function ResetSessionData()
-    initialCount = nil
-    startTime = nil
-end
+local activeTrackers = {} -- Runtime tracker frame instances
+local customOptionsFrame = nil
+local RebuildAllTrackers -- Forward declaration
 
 ----------------------------------------------------
 -- VALUE & FORMATTING HELPERS
 ----------------------------------------------------
 local function GetCurrentTotal(targetID, isCurrency)
+    if not targetID then return 0 end
     if isCurrency then
         local currNum = tonumber(string.sub(targetID, 2))
         if currNum == 0 then
-            -- Tracking Gold (in Copper)
             return GetMoney() or 0
         else
             local info = C_CurrencyInfo.GetCurrencyInfo(currNum)
@@ -82,6 +67,9 @@ local function GetCurrentTotal(targetID, isCurrency)
 end
 
 local function GetTargetDetails(targetID, isCurrency)
+    if not targetID then
+        return "No Target Selected", "Interface\\Icons\\INV_Misc_QuestionMark"
+    end
     if isCurrency then
         local currNum = tonumber(string.sub(targetID, 2))
         if currNum == 0 then
@@ -100,19 +88,168 @@ local function GetTargetDetails(targetID, isCurrency)
     end
 end
 
-local function FormatValue(val, isCurrency)
-    if isCurrency and tonumber(string.sub(trackingTargetID, 2)) == 0 then
-        -- Gold formatting
+local function FormatValue(val, targetID, isCurrency)
+    if isCurrency and targetID and tonumber(string.sub(targetID, 2)) == 0 then
         return GetCoinTextureString(val)
     end
     return tostring(val)
 end
 
 ----------------------------------------------------
--- CUSTOM STANDALONE OPTIONS FRAME
+-- DYNAMIC TRACKER FRAME CREATOR
 ----------------------------------------------------
-local customOptionsFrame = CreateFrame("Frame", "ItemTrackerCustomOptionsFrame", UIParent, "BackdropTemplate")
-customOptionsFrame:SetSize(420, 360)
+local function CreateTrackerInstance(itemEntry, index)
+    local instance = {
+        itemEntry = itemEntry,
+        index = index,
+    }
+
+    -- Main Container Frame
+    local f = CreateFrame("Button", "ItemTrackerFrame_" .. index, UIParent, "BackdropTemplate")
+    f:SetSize(220, 95)
+
+    if itemEntry.pos then
+        f:SetPoint(itemEntry.pos[1], UIParent, itemEntry.pos[3], itemEntry.pos[4], itemEntry.pos[5])
+    else
+        f:SetPoint("CENTER", UIParent, "CENTER", (index - 1) * 30, (index - 1) * -30)
+    end
+
+    f:SetMovable(true)
+    f:EnableMouse(true)
+    f:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    f:RegisterForDrag("LeftButton")
+    f:SetScript("OnDragStart", f.StartMoving)
+    f:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        local point, _, relPoint, x, y = self:GetPoint()
+        itemEntry.pos = { point, nil, relPoint, x, y }
+    end)
+
+    f:SetBackdrop({
+        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+        edgeFile = "Interface\\PVPFrame\\UI-Character-PVP-Highlight",
+        tile = true, tileSize = 16, edgeSize = 12,
+        insets = { left = 3, right = 3, top = 3, bottom = 3 }
+    })
+    f:SetBackdropColor(0, 0, 0, 0.8)
+
+    -- Right-Click Any Frame to Open Options
+    f:SetScript("OnClick", function(self, button)
+        if button == "RightButton" then
+            if customOptionsFrame then customOptionsFrame:Show() end
+        end
+    end)
+
+    -- Header Buttons
+    local closeButton = CreateFrame("Button", nil, f, "UIPanelCloseButton")
+    closeButton:SetPoint("TOPRIGHT", f, "TOPRIGHT", -2, -2)
+    closeButton:SetScript("OnClick", function()
+        itemEntry.tracking = false
+        RebuildAllTrackers()
+    end)
+
+    local uiResetBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    uiResetBtn:SetSize(18, 18)
+    uiResetBtn:SetPoint("RIGHT", closeButton, "LEFT", 2, 0)
+    uiResetBtn:SetText("R")
+    uiResetBtn:SetScript("OnClick", function()
+        itemEntry.initialCount = nil
+        itemEntry.startTime = nil
+        instance:UpdateDisplay()
+        print("|cff00ff00[ItemTracker]|r Reset session baseline.")
+    end)
+
+    -- Text & Icon components inside `f`
+    local icon = f:CreateTexture(nil, "ARTWORK")
+    icon:SetSize(32, 32)
+    icon:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -10)
+
+    local titleText = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightMedium")
+    titleText:SetPoint("TOPLEFT", icon, "TOPRIGHT", 8, 0)
+    titleText:SetPoint("RIGHT", uiResetBtn, "LEFT", -4, 0)
+    titleText:SetJustifyH("LEFT")
+
+    local countText = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    countText:SetPoint("TOPLEFT", icon, "BOTTOMLEFT", 0, -6)
+
+    local rateText = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    rateText:SetPoint("TOPLEFT", countText, "BOTTOMLEFT", 0, -4)
+
+    function instance:UpdateDisplay()
+        if not itemEntry.tracking then
+            f:Hide()
+            return
+        else
+            f:Show()
+        end
+
+        local targetID = itemEntry.id
+        local isCurrency = type(targetID) == "string" and string.sub(targetID, 1, 1) == "c"
+
+        local name, texture = GetTargetDetails(targetID, isCurrency)
+        titleText:SetText(name)
+        if texture then icon:SetTexture(texture) end
+
+        if not targetID then
+            countText:SetText("Total: 0")
+            rateText:SetText("Session: +0 (0/hr)")
+            return
+        end
+
+        local currentTotal = GetCurrentTotal(targetID, isCurrency)
+
+        -- Retain existing session baseline on itemEntry across frame rebuilds
+        if not itemEntry.initialCount then
+            itemEntry.initialCount = currentTotal
+            itemEntry.startTime = GetTime()
+        end
+
+        local gained = currentTotal - itemEntry.initialCount
+        local elapsedSeconds = GetTime() - (itemEntry.startTime or GetTime())
+        local itemsPerHour = (elapsedSeconds > 0) and math.floor((gained / elapsedSeconds) * 3600) or 0
+
+        countText:SetText("Total: " .. FormatValue(currentTotal, targetID, isCurrency))
+        local gainColor = gained >= 0 and "|cff00ff00+" or "|cffff0000"
+        rateText:SetText(string.format("Session: %s%s|r (%s/hr)", 
+            gainColor, 
+            FormatValue(gained, targetID, isCurrency), 
+            FormatValue(itemsPerHour, targetID, isCurrency)
+        ))
+    end
+
+    instance.frame = f
+    table.insert(activeTrackers, instance)
+    
+    instance:UpdateDisplay()
+    return instance
+end
+
+RebuildAllTrackers = function()
+    for _, tracker in ipairs(activeTrackers) do
+        if tracker.frame then
+            tracker.frame:Hide()
+            tracker.frame:SetParent(nil)
+        end
+    end
+    activeTrackers = {}
+
+    local activeIndex = 1
+    for _, itemEntry in ipairs(ItemTrackerDB.savedItems) do
+        if type(itemEntry) == "table" and itemEntry.tracking then
+            CreateTrackerInstance(itemEntry, activeIndex)
+            activeIndex = activeIndex + 1
+        end
+    end
+    if customOptionsFrame and customOptionsFrame:IsShown() then
+        if customOptionsFrame.RefreshList then customOptionsFrame:RefreshList() end
+    end
+end
+
+----------------------------------------------------
+-- CUSTOM OPTIONS FRAME
+----------------------------------------------------
+customOptionsFrame = CreateFrame("Frame", "ItemTrackerCustomOptionsFrame", UIParent, "BackdropTemplate")
+customOptionsFrame:SetSize(460, 380)
 customOptionsFrame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
 customOptionsFrame:SetMovable(true)
 customOptionsFrame:EnableMouse(true)
@@ -129,35 +266,22 @@ customOptionsFrame:SetBackdrop({
     insets = { left = 11, right = 12, top = 12, bottom = 11 }
 })
 
--- Header / Title
 local optTitle = customOptionsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 optTitle:SetPoint("TOPLEFT", 20, -20)
 optTitle:SetText("Item & Currency Tracker Options")
 
--- Close Button
 local optCloseBtn = CreateFrame("Button", nil, customOptionsFrame, "UIPanelCloseButton")
 optCloseBtn:SetPoint("TOPRIGHT", customOptionsFrame, "TOPRIGHT", -5, -5)
 
--- Reset Session Button
-local optResetBtn = CreateFrame("Button", nil, customOptionsFrame, "UIPanelButtonTemplate")
-optResetBtn:SetSize(130, 22)
-optResetBtn:SetPoint("TOPRIGHT", customOptionsFrame, "TOPRIGHT", -40, -18)
-optResetBtn:SetText("Reset Session")
-optResetBtn:SetScript("OnClick", function()
-    ResetSessionData()
-    print("|cff00ff00[ItemTracker]|r Session tracking reset.")
-end)
-
--- Input Box to Add New Item/Currency
 local addInput = CreateFrame("EditBox", "ItemTrackerAddInput", customOptionsFrame, "InputBoxTemplate")
 addInput:SetSize(160, 22)
 addInput:SetPoint("TOPLEFT", optTitle, "BOTTOMLEFT", 0, -20)
 addInput:SetAutoFocus(false)
 
-local addBtn = CreateFrame("Button", nil, customOptionsFrame, "UIPanelButtonTemplate")
-addBtn:SetSize(100, 22)
-addBtn:SetPoint("LEFT", addInput, "RIGHT", 10, 0)
-addBtn:SetText("Add Target")
+local addSavedBtn = CreateFrame("Button", nil, customOptionsFrame, "UIPanelButtonTemplate")
+addSavedBtn:SetSize(140, 22)
+addSavedBtn:SetPoint("LEFT", addInput, "RIGHT", 10, 0)
+addSavedBtn:SetText("+ Add to Saved Items")
 
 local scrollFrame, contentFrame
 
@@ -171,43 +295,51 @@ local function RefreshOptionsList()
 
     local yOffset = 0
     if ItemTrackerDB and ItemTrackerDB.savedItems then
-        for idx, savedID in ipairs(ItemTrackerDB.savedItems) do
-            local isCurr = type(savedID) == "string" and string.sub(savedID, 1, 1) == "c"
+        for idx, itemEntry in ipairs(ItemTrackerDB.savedItems) do
+            local targetID = (type(itemEntry) == "table") and itemEntry.id or itemEntry
+            local isTracking = (type(itemEntry) == "table") and itemEntry.tracking or false
+            local isCurr = type(targetID) == "string" and string.sub(targetID, 1, 1) == "c"
+
             local row = CreateFrame("Frame", nil, contentFrame)
-            row:SetSize(350, 26)
+            row:SetSize(390, 26)
             row:SetPoint("TOPLEFT", 0, -yOffset)
 
             local iconTex = row:CreateTexture(nil, "ARTWORK")
             iconTex:SetSize(20, 20)
             iconTex:SetPoint("LEFT", 0, 0)
 
-            local name, texture = GetTargetDetails(savedID, isCurr)
+            local name, texture = GetTargetDetails(targetID, isCurr)
             iconTex:SetTexture(texture)
 
             local nameText = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-            nameText:SetPoint("LEFT", iconTex, "RIGHT", 8, 0)
-            nameText:SetPoint("RIGHT", row, "RIGHT", -120, 0)
+            nameText:SetPoint("LEFT", iconTex, "RIGHT", 6, 0)
+            nameText:SetPoint("RIGHT", row, "RIGHT", -190, 0)
             nameText:SetJustifyH("LEFT")
-            nameText:SetText(name .. (isCurr and " |cff808080(Currency)|r" or ""))
+            nameText:SetText(name)
 
-            local trackBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-            trackBtn:SetSize(55, 20)
-            trackBtn:SetPoint("RIGHT", row, "RIGHT", -55, 0)
-            trackBtn:SetText("Track")
-            trackBtn:SetScript("OnClick", function()
-                trackingTargetID = savedID
-                isTrackingCurrency = isCurr
-                ItemTrackerDB.targetID = savedID
-                ResetSessionData()
-                print("|cff00ff00[ItemTracker]|r Now tracking: " .. name)
+            -- Button: Toggle Tracking On / Off
+            local toggleBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+            toggleBtn:SetSize(100, 20)
+            toggleBtn:SetPoint("RIGHT", row, "RIGHT", -60, 0)
+            toggleBtn:SetText(isTracking and "|cff00ff00Tracking ON|r" or "|cffff0000Tracking OFF|r")
+            toggleBtn:SetScript("OnClick", function()
+                if type(itemEntry) ~= "table" then
+                    ItemTrackerDB.savedItems[idx] = { id = itemEntry, tracking = true }
+                else
+                    itemEntry.tracking = not itemEntry.tracking
+                end
+                RebuildAllTrackers()
+                RefreshOptionsList()
             end)
 
+            -- Button: Remove item from saved list
             local delBtn = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
             delBtn:SetSize(50, 20)
-            delBtn:SetPoint("LEFT", trackBtn, "RIGHT", 4, 0)
+            delBtn:SetPoint("LEFT", toggleBtn, "RIGHT", 4, 0)
             delBtn:SetText("Delete")
             delBtn:SetScript("OnClick", function()
                 table.remove(ItemTrackerDB.savedItems, idx)
+                RebuildAllTrackers()
                 RefreshOptionsList()
             end)
 
@@ -217,47 +349,48 @@ local function RefreshOptionsList()
     contentFrame:SetHeight(math.max(yOffset, 100))
 end
 
--- Helper to add target to saved table safely
-local function AddTargetFromInput()
+customOptionsFrame.RefreshList = RefreshOptionsList
+
+local function AddItemToSavedList()
     local text = addInput:GetText()
-    local targetID, isCurr = GetTargetFromInput(text)
+    local targetID, _ = GetTargetFromInput(text)
     if targetID then
-        for _, existingID in ipairs(ItemTrackerDB.savedItems) do
+        for _, entry in ipairs(ItemTrackerDB.savedItems) do
+            local existingID = (type(entry) == "table") and entry.id or entry
             if existingID == targetID then
-                print("|cffff0000[ItemTracker]|r Target is already in your list.")
+                print("|cffff0000[ItemTracker]|r Item is already in your saved list.")
                 addInput:SetText("")
                 addInput:ClearFocus()
                 return
             end
         end
         
-        table.insert(ItemTrackerDB.savedItems, targetID)
+        table.insert(ItemTrackerDB.savedItems, { id = targetID, tracking = false })
         addInput:SetText("")
         addInput:ClearFocus()
         RefreshOptionsList()
-        local name = GetTargetDetails(targetID, isCurr)
-        print("|cff00ff00[ItemTracker]|r Added " .. name)
+        local name, _ = GetTargetDetails(targetID, type(targetID) == "string" and string.sub(targetID, 1, 1) == "c")
+        print("|cff00ff00[ItemTracker]|r Added to saved list: " .. name)
     else
         print("|cffff0000[ItemTracker]|r Invalid Item/Currency ID, Link, or Keyword.")
     end
 end
 
-addBtn:SetScript("OnClick", AddTargetFromInput)
-addInput:SetScript("OnEnterPressed", AddTargetFromInput)
+addSavedBtn:SetScript("OnClick", AddItemToSavedList)
+addInput:SetScript("OnEnterPressed", AddItemToSavedList)
 
--- Support dragging items onto the input box
 local function HandleItemDrop()
     local infoType, itemID = GetCursorInfo()
     if infoType == "item" and itemID then
         addInput:SetText(tostring(itemID))
-        AddTargetFromInput()
+        AddItemToSavedList()
         ClearCursor()
     end
 end
 
 addInput:SetScript("OnReceiveDrag", HandleItemDrop)
 addInput:SetScript("OnMouseDown", HandleItemDrop)
-addBtn:SetScript("OnReceiveDrag", HandleItemDrop)
+addSavedBtn:SetScript("OnReceiveDrag", HandleItemDrop)
 
 hooksecurefunc("ChatEdit_InsertLink", function(text)
     if addInput and addInput:HasFocus() then
@@ -266,117 +399,14 @@ hooksecurefunc("ChatEdit_InsertLink", function(text)
 end)
 
 scrollFrame = CreateFrame("ScrollFrame", "ItemTrackerScrollFrame", customOptionsFrame, "UIPanelScrollFrameTemplate")
-scrollFrame:SetSize(360, 220)
+scrollFrame:SetSize(400, 240)
 scrollFrame:SetPoint("TOPLEFT", addInput, "BOTTOMLEFT", 0, -20)
 
 contentFrame = CreateFrame("Frame", nil, scrollFrame)
-contentFrame:SetSize(340, 220)
+contentFrame:SetSize(380, 240)
 scrollFrame:SetScrollChild(contentFrame)
 
 customOptionsFrame:SetScript("OnShow", RefreshOptionsList)
-
-local function ToggleOptionsMenu()
-    if customOptionsFrame:IsShown() then
-        customOptionsFrame:Hide()
-    else
-        customOptionsFrame:Show()
-    end
-end
-
-----------------------------------------------------
--- MAIN TRACKER FRAME SETUP
-----------------------------------------------------
-local frame = CreateFrame("Button", "ItemTrackerFrame", UIParent, "BackdropTemplate")
-frame:SetSize(220, 95)
-frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
-frame:SetMovable(true)
-frame:EnableMouse(true)
-frame:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-frame:RegisterForDrag("LeftButton")
-frame:SetScript("OnDragStart", frame.StartMoving)
-frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
-
-frame:SetBackdrop({
-    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-    edgeFile = "Interface\\PVPFrame\\UI-Character-PVP-Highlight",
-    tile = true, tileSize = 16, edgeSize = 12,
-    insets = { left = 3, right = 3, top = 3, bottom = 3 }
-})
-frame:SetBackdropColor(0, 0, 0, 0.8)
-
-frame:SetScript("OnClick", function(self, button)
-    if button == "RightButton" then
-        ToggleOptionsMenu()
-    end
-end)
-
-local closeButton = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
-closeButton:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -2, -2)
-closeButton:SetScript("OnClick", function()
-    frame:Hide()
-    ItemTrackerDB.shown = false
-end)
-
-local uiResetBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-uiResetBtn:SetSize(18, 18)
-uiResetBtn:SetPoint("RIGHT", closeButton, "LEFT", 2, 0)
-uiResetBtn:SetText("R")
-uiResetBtn:SetScript("OnClick", function()
-    ResetSessionData()
-    print("|cff00ff00[ItemTracker]|r Session tracking reset.")
-end)
-uiResetBtn:SetScript("OnEnter", function(self)
-    GameTooltip:SetOwner(self, "ANCHOR_TOP")
-    GameTooltip:SetText("Reset Session Data", 1, 1, 1)
-    GameTooltip:AddLine("Resets baseline count and hourly rate timer.", 0.8, 0.8, 0.8)
-    GameTooltip:Show()
-end)
-uiResetBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-local icon = frame:CreateTexture(nil, "ARTWORK")
-icon:SetSize(32, 32)
-icon:SetPoint("TOPLEFT", frame, "TOPLEFT", 10, -10)
-icon:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
-
-local titleText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightMedium")
-titleText:SetPoint("TOPLEFT", icon, "TOPRIGHT", 8, 0)
-titleText:SetPoint("RIGHT", uiResetBtn, "LEFT", -4, 0)
-titleText:SetText("No Target Selected")
-titleText:SetJustifyH("LEFT")
-
-local countText = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-countText:SetPoint("TOPLEFT", icon, "BOTTOMLEFT", 0, -6)
-countText:SetText("Total: 0")
-
-local rateText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-rateText:SetPoint("TOPLEFT", countText, "BOTTOMLEFT", 0, -4)
-rateText:SetText("Session: +0 (0/hr)")
-
-----------------------------------------------------
--- DISPLAY UPDATE LOGIC
-----------------------------------------------------
-local function UpdateDisplay()
-    if not trackingTargetID then return end
-
-    local currentTotal = GetCurrentTotal(trackingTargetID, isTrackingCurrency)
-    local name, texture = GetTargetDetails(trackingTargetID, isTrackingCurrency)
-
-    titleText:SetText(name)
-    if texture then icon:SetTexture(texture) end
-
-    if not initialCount then
-        initialCount = currentTotal
-        startTime = GetTime()
-    end
-
-    local gained = currentTotal - initialCount
-    local elapsedSeconds = GetTime() - startTime
-    local itemsPerHour = (elapsedSeconds > 0) and math.floor((gained / elapsedSeconds) * 3600) or 0
-
-    countText:SetText("Total: " .. FormatValue(currentTotal, isTrackingCurrency))
-    local gainColor = gained >= 0 and "|cff00ff00+" or "|cffff0000"
-    rateText:SetText(string.format("Session: %s%s|r (%s/hr)", gainColor, FormatValue(gained, isTrackingCurrency), FormatValue(itemsPerHour, isTrackingCurrency)))
-end
 
 ----------------------------------------------------
 -- MINIMAP BUTTON SETUP
@@ -421,24 +451,13 @@ minimapBtn:SetScript("OnDragStop", function(self)
 end)
 
 minimapBtn:SetScript("OnClick", function(self, button)
-    if button == "RightButton" then
-        ToggleOptionsMenu()
-    else
-        if frame:IsShown() then
-            frame:Hide()
-            ItemTrackerDB.shown = false
-        else
-            frame:Show()
-            ItemTrackerDB.shown = true
-        end
-    end
+    customOptionsFrame:Show()
 end)
 
 minimapBtn:SetScript("OnEnter", function(self)
     GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-    GameTooltip:AddLine("Item & Currency Tracker")
-    GameTooltip:AddLine("|cffffffffLeft-Click:|r Toggle Display Frame", 0.8, 0.8, 0.8)
-    GameTooltip:AddLine("|cffffffffRight-Click:|r Open Options Menu", 0.8, 0.8, 0.8)
+    GameTooltip:AddLine("Multi-Item & Currency Tracker")
+    GameTooltip:AddLine("|cffffffffClick:|r Open Options Menu", 0.8, 0.8, 0.8)
     GameTooltip:AddLine("|cffffffffDrag:|r Move Minimap Button", 0.8, 0.8, 0.8)
     GameTooltip:Show()
 end)
@@ -448,36 +467,37 @@ minimapBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 ----------------------------------------------------
 -- TIMER & EVENTS
 ----------------------------------------------------
-local timerGroup = frame:CreateAnimationGroup()
+local eventDriver = CreateFrame("Frame")
+
+local function UpdateAllDisplays()
+    for _, tracker in ipairs(activeTrackers) do
+        tracker:UpdateDisplay()
+    end
+end
+
+local timerGroup = eventDriver:CreateAnimationGroup()
 local timerAnim = timerGroup:CreateAnimation()
 timerAnim:SetDuration(1.0)
 timerGroup:SetLooping("REPEAT")
-timerGroup:SetScript("OnLoop", UpdateDisplay)
+timerGroup:SetScript("OnLoop", UpdateAllDisplays)
 
-frame:RegisterEvent("ADDON_LOADED")
-frame:RegisterEvent("PLAYER_LOGIN")
-frame:RegisterEvent("BAG_UPDATE")
-frame:RegisterEvent("CURRENCY_DISPLAY_UPDATE")
-frame:RegisterEvent("PLAYER_MONEY")
-frame:SetScript("OnEvent", function(self, event, arg1)
+eventDriver:RegisterEvent("ADDON_LOADED")
+eventDriver:RegisterEvent("PLAYER_LOGIN")
+eventDriver:RegisterEvent("BAG_UPDATE")
+eventDriver:RegisterEvent("CURRENCY_DISPLAY_UPDATE")
+eventDriver:RegisterEvent("PLAYER_MONEY")
+
+eventDriver:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == addonName then
         InitDB()
-        trackingTargetID = ItemTrackerDB.targetID
-        isTrackingCurrency = type(trackingTargetID) == "string" and string.sub(trackingTargetID, 1, 1) == "c"
-        
-        if ItemTrackerDB.shown then
-            frame:Show()
-        else
-            frame:Hide()
-        end
-        
         UpdateMinimapPos()
+        RebuildAllTrackers()
         timerGroup:Play()
     elseif event == "PLAYER_LOGIN" then
-        ResetSessionData()
-        UpdateDisplay()
+        InitDB()
+        RebuildAllTrackers()
     elseif event == "BAG_UPDATE" or event == "CURRENCY_DISPLAY_UPDATE" or event == "PLAYER_MONEY" then
-        UpdateDisplay()
+        UpdateAllDisplays()
     end
 end)
 
@@ -490,34 +510,41 @@ SlashCmdList["ITEMTRACKER"] = function(msg)
     msg = string.lower(trim(msg or ""))
     
     if msg == "options" or msg == "opt" then
-        ToggleOptionsMenu()
-    elseif msg == "toggle" then
-        if frame:IsShown() then frame:Hide() ItemTrackerDB.shown = false else frame:Show() ItemTrackerDB.shown = true end
-    elseif msg == "show" then
-        frame:Show() ItemTrackerDB.shown = true
-    elseif msg == "hide" then
-        frame:Hide() ItemTrackerDB.shown = false
+        customOptionsFrame:Show()
     elseif msg == "reset" then
-        ResetSessionData()
-        UpdateDisplay()
-        print("|cff00ff00[ItemTracker]|r Session counter reset.")
+        for _, entry in ipairs(ItemTrackerDB.savedItems) do
+            if type(entry) == "table" then
+                entry.initialCount = nil
+                entry.startTime = nil
+            end
+        end
+        UpdateAllDisplays()
+        print("|cff00ff00[ItemTracker]|r Reset session counters for all items.")
     else
-        local targetID, isCurr = GetTargetFromInput(msg)
+        local targetID, _ = GetTargetFromInput(msg)
         if targetID then
-            trackingTargetID = targetID
-            isTrackingCurrency = isCurr
-            ItemTrackerDB.targetID = trackingTargetID
-            ResetSessionData()
-            UpdateDisplay()
-            local name = GetTargetDetails(targetID, isCurr)
-            print("|cff00ff00[ItemTracker]|r Now tracking: " .. name)
+            local found = false
+            for _, entry in ipairs(ItemTrackerDB.savedItems) do
+                local existingID = (type(entry) == "table") and entry.id or entry
+                if existingID == targetID then
+                    if type(entry) == "table" then
+                        entry.tracking = true
+                    end
+                    found = true
+                    break
+                end
+            end
+            if not found then
+                table.insert(ItemTrackerDB.savedItems, { id = targetID, tracking = true })
+            end
+            RebuildAllTrackers()
+            local name, _ = GetTargetDetails(targetID, type(targetID) == "string" and string.sub(targetID, 1, 1) == "c")
+            print("|cff00ff00[ItemTracker]|r Enabled tracking for: " .. name)
         else
             print("|cff00ff00[ItemTracker] Commands:|r")
             print("  /it opt - Open Options Window")
-            print("  /it reset - Reset session gains and rate timer")
-            print("  /it gold - Track character gold rate")
-            print("  /it c<CurrencyID> - Track a currency (e.g., /it c1792 for Honor)")
-            print("  /it <ItemID or ItemLink> - Track an item")
+            print("  /it reset - Reset session counters on all active frames")
+            print("  /it <ItemID, Link, or gold> - Enable tracking for item")
         end
     end
 end
